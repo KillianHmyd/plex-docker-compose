@@ -1,0 +1,377 @@
+version: "3.7"
+
+networks:
+  traefik_proxy:
+    name: traefik_proxy
+    driver: bridge
+  internal:
+    name: internal
+    driver: bridge
+
+services:
+  ## Network
+  traefik:
+    container_name: traefik
+    image: traefik:alpine
+    command: --web --docker --docker.domain=docker.localhost --logLevel=DEBUG
+    labels:
+      traefik.frontend.auth.basic.users: "${TRAEFIK_HTPASSWD}"
+      traefik.frontend.rule: "Host:traefik.${DOMAIN}"
+      traefik.port: 8083
+    networks:
+      - traefik_proxy
+    ports:
+      - 443:443
+      - 80:80
+    expose:
+      - 8083
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ./configs/traefik/acme:/acme:rw
+      - ./configs/traefik/certs:/certs:rw
+      - ./configs/traefik/traefik.toml:/traefik.toml:rw
+
+  ## Drive Mounts
+  rclone:
+    container_name: rclone
+    restart: unless-stopped
+    image: mumiehub/rclone-mount:latest
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
+    environment:
+      - ConfigDir=/config/
+      - ConfigName=rclone.conf
+      - "RemotePath=gcrypt:"
+      - MountPoint=/mnt/gdrive
+      - MountCommands=--log-level INFO --rc --allow-other --allow-non-empty --dir-cache-time 96h --drive-chunk-size 256M --buffer-size 1G --timeout 1h --vfs-read-chunk-size=128M --vfs-read-chunk-size-limit off --fast-list --vfs-cache-max-size 10G --drive-use-trash=true --uid=0 --gid=999 --umask 002 --user-agent="Chrome/74.0.3729.157"
+    volumes:
+      - ./configs/rclone-encrypted/:/config:shared
+      - ./media:/mnt/gdrive:shared
+  
+## Torrents Management
+  transmission:
+    container_name: transmission
+    image: linuxserver/transmission
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Europe/Paris
+    expose:
+      - 9091
+      - 51413
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: transmission
+      traefik.frontend.rule: "Host:transmission.${DOMAIN}"
+      traefik.port: 9091
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/transmission/config:/config:rw
+      - ./downloads:/downloads:rw
+
+  jackett:
+    container_name: jackett
+    image: linuxserver/jackett:development
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Europe/Paris
+    expose:
+      - 9117
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: jackett
+      traefik.frontend.rule: "Host:jackett.${DOMAIN}"
+      traefik.port: 9117
+    depends_on:
+      - traefik
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/jackett/config:/config:rw
+
+  ## Plex services
+  plex:
+    container_name: plex
+    image: linuxserver/plex
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - VERSION=docker
+      - "PLEX_CLAIM=${PLEX_CLAIM}"
+      - HOSTNAME=DockerPlex
+      - "ADVERTISE_IP=https://plex.${DOMAIN}/"
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: plex
+      traefik.frontend.rule: Host:plex.${DOMAIN}
+      traefik.port: 32400
+    depends_on:
+      - rclone
+    networks:
+      - traefik_proxy
+      - internal
+    ports:
+      - 1900:1900/udp
+      - 32410:32410/udp
+      - 32469:32469
+      - 32413:32413/udp
+      - 32412:32412/udp
+      - 32414:32414/udp
+      - 3005:3005
+      - 32400:32400
+      - 8324:8324
+    restart: unless-stopped
+    volumes:
+      - ./configs/plex/transcoded-media:/transcode:rw
+      - ./configs/plex/config:/config:rw
+      - ./configs/plex/data:/data:rw
+      - ./media:/media:rw
+
+  radarr:
+    container_name: radarr
+    image: linuxserver/radarr
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Europe/Paris
+    expose:
+      - 7878
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: radarr
+      traefik.frontend.rule: Host:radarr.${DOMAIN}
+      traefik.port: 7878
+    depends_on:
+      - jackett
+      - transmission
+      - rclone
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/radarr/config:/config:rw
+      - ./media:/shared/media:rw
+      - ./downloads:/downloads:rw
+
+  radarr4K:
+    container_name: radarr4K
+    image: linuxserver/radarr
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Europe/Paris
+    expose:
+      - 7878
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: radarr4K
+      traefik.frontend.rule: Host:radarr4K.${DOMAIN}
+      traefik.port: 7878
+    depends_on:
+      - jackett
+      - transmission
+      - rclone
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/radarr4K/config:/config:rw
+      - ./media:/shared/media:rw
+      - ./downloads:/downloads:rw
+
+  syncarr:
+    image: syncarr/syncarr:latest
+    container_name: syncarr
+    restart: unless-stopped
+    environment:
+        RADARR_A_URL: http://radarr:7878
+        RADARR_A_KEY: ${RADARR_FHD_KEY}
+        RADARR_A_PATH: /shared/media/movies
+        RADARR_A_PROFILE: ${RADARR_FHD_PROFILE}
+
+        RADARR_B_URL: http://radarr4K:7878
+        RADARR_B_KEY: ${RADARR_4K_KEY}
+        RADARR_B_PROFILE: ${RADARR_4K_PROFILE}
+        RADARR_B_PATH: /shared/media/movies_4k
+    depends_on:
+      - radarr
+      - radarr4K
+    networks:
+      - internal
+    volumes:
+      - ./configs/syncarr/config.py:/app/config.py
+
+  sonarr:
+    container_name: sonarr
+    image: linuxserver/sonarr:preview
+    environment:
+      - PUID=1000
+      - PGID=1001
+      - TZ=Europe/Paris
+    expose:
+      - 8989
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: sonarr
+      traefik.frontend.rule: "Host:sonarr.${DOMAIN}"
+      traefik.port: 8989
+    depends_on:
+      - jackett
+      - transmission
+      - rclone
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/sonarr/config:/config:rw
+      - ./media:/shared/media:rw
+      - ./downloads:/shared/downloads:rw
+
+  ombi:
+    container_name: ombi
+    image: linuxserver/ombi
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Paris
+    expose:
+      - 3579
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: ombi
+      traefik.frontend.rule: "Host:ombi.${DOMAIN}"
+      traefik.port: 3579
+    depends_on:
+      - sonarr
+      - radarr
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+    volumes:
+      - ./configs/ombi:/config:rw
+
+  ## Monitoring
+  tautulli:
+    image: linuxserver/tautulli
+    container_name: tautulli
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/London
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: tautulli
+      traefik.frontend.rule: Host:tautulli.${DOMAIN}
+      traefik.port: 8181
+    volumes:
+      - ./configs/tautulli:/config
+      - ./configs/tautulli/logs:/logs
+    depends_on:
+      - plex
+    networks:
+      - traefik_proxy
+      - internal
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    user: "0"
+    depends_on:
+      - prometheus
+    networks:
+      - traefik_proxy
+      - internal
+    environment:
+      - TZ=Europe/Paris
+    expose:
+      - 3000
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: grafana
+      traefik.frontend.rule: "Host:grafana.${DOMAIN}"
+      traefik.port: 3000
+    volumes:
+      - ./configs/grafana/data:/var/lib/grafana
+      - ./configs/grafana/conf:/usr/share/grafana/conf   
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    depends_on:
+      - node_exporter
+      - cadvisor
+      - dc_exporter
+    networks:
+      - traefik_proxy
+      - internal
+    environment:
+      - TZ=Europe/Paris
+    expose:
+      - 9090
+    labels:
+      traefik.docker.network: traefik_proxy
+      traefik.backend: prometheus
+      traefik.frontend.rule: "Host:prometheus.${DOMAIN}"
+      traefik.port: 9090
+      traefik.frontend.auth.basic.users: "${PROMETHEUS_HTPASSWD}"
+    volumes:
+      - ./configs/prometheus:/etc/prometheus
+
+  node_exporter:
+    image: prom/node-exporter:latest
+    container_name: node_exporter
+    networks:
+      - internal
+    environment:
+      - TZ=Europe/Paris
+    expose:
+      - 9100
+    ports:
+      - 9100:9100 
+
+  cadvisor:
+    image: google/cadvisor:latest
+    container_name: cadvisor
+    restart: unless-stopped
+    command: "--enable_load_reader=true"
+    networks:
+      - internal
+    expose:
+      - 8080
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+
+  dc_exporter:
+    image: killianhmyd/dc-exporter:latest
+    container_name: dc_exporter
+    networks:
+      - internal
+    environment:
+      - TZ=Europe/Paris
+      - WORKING_DIRECTORY=/root
+    expose:
+      - 8787
+    ports:
+      - 8787:8787
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /root/docker-compose.yml:/root/docker-compose.yml
